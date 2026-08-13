@@ -272,45 +272,59 @@ static bool bdh_init_from_blob(const void* blob) {
     w_decoder = data;    data += (uint32_t)nhN * D;
     w_lm_head = data;
 
-    // Hoist the encoder into PSRAM. It's the hottest weight tensor: every
-    // layer re-reads all nh*N*D bytes (weights are shared, activations
-    // differ), so it costs ~13MB of reads per token — 56% of the time.
-    // Flash is stuck at DIO (~20MB/s) because OPI PSRAM claims the pins
-    // needed for QIO; PSRAM itself is octal and ~4x faster. Allocate this
-    // BEFORE the caches so it gets a contiguous block, and fall back to
-    // reading from flash if it doesn't fit.
     const int8_t* encoder_in_flash = w_encoder;
-    encoder_psram = (int8_t*)ps_malloc((size_t)nh * N * D);
-    if (encoder_psram) {
-        memcpy(encoder_psram, encoder_in_flash, (size_t)nh * N * D);
-        w_encoder = encoder_psram;
-    }
 
-    // The caches are mandatory, the PSRAM encoder copy is an optimization —
-    // if the big one won't fit alongside it, hand the memory back and read
-    // the encoder from flash instead of failing to boot.
-    kr_cache = (int8_t*)ps_malloc((size_t)n_layer * nh * T_MAX * N);
-    if (!kr_cache && encoder_psram) {
+    // Try to bring up the buffers twice: once with the encoder hoisted into
+    // PSRAM, and if anything at all fails, again without it.
+    //
+    // Hoisting the encoder is the optimization — it's the hottest weight
+    // tensor (every layer re-reads all nh*N*D bytes, ~13MB/token), and
+    // PSRAM beats DIO flash, which is stuck at ~20MB/s because OPI PSRAM
+    // claims the pins QIO would need. But it costs 2.11MB of an 8MB budget
+    // the caches nearly fill, so it must degrade gracefully: a failed
+    // allocation should cost speed, never boot. Worth ~12%; if you raise
+    // T_MAX, expect this to be the thing that stops fitting.
+    for (int attempt = 0; attempt < 2; attempt++) {
+        bool hoist = (attempt == 0);
+
+        if (hoist) {
+            encoder_psram = (int8_t*)ps_malloc((size_t)nh * N * D);
+            if (!encoder_psram) continue;   // no room at all — retry without
+            memcpy(encoder_psram, encoder_in_flash, (size_t)nh * N * D);
+            w_encoder = encoder_psram;
+        } else {
+            w_encoder = encoder_in_flash;
+        }
+
+        kr_cache   = (int8_t*)ps_malloc((size_t)n_layer * nh * T_MAX * N);
+        kr_scale   = (float*)ps_malloc((size_t)n_layer * nh * T_MAX * sizeof(float));
+        x_cache    = (float*)ps_malloc((size_t)n_layer * T_MAX * D * sizeof(float));
+        cur_x      = (float*)ps_malloc(D * sizeof(float));
+        cur_sparse = (float*)ps_malloc((size_t)nh * N * sizeof(float));
+        cur_qr     = (float*)ps_malloc(N * sizeof(float));
+        cur_xy     = (float*)ps_malloc((size_t)nh * N * sizeof(float));
+        cur_ykv    = (float*)ps_malloc(D * sizeof(float));
+        cur_y      = (float*)ps_malloc(D * sizeof(float));
+        buf_logits = (float*)ps_malloc(256 * sizeof(float));
+        rope_freqs = (float*)ps_malloc(N * sizeof(float));
+
+        if (kr_cache && kr_scale && x_cache && cur_x && cur_sparse &&
+            cur_qr && cur_xy && cur_ykv && cur_y && buf_logits && rope_freqs)
+            break;   // all good
+
+        if (!hoist) return false;   // even the lean layout doesn't fit
+
+        // Give everything back and retry reading the encoder from flash.
+        free(kr_cache);   free(kr_scale);  free(x_cache);   free(cur_x);
+        free(cur_sparse); free(cur_qr);    free(cur_xy);    free(cur_ykv);
+        free(cur_y);      free(buf_logits); free(rope_freqs);
         free(encoder_psram);
+        kr_cache = nullptr; kr_scale = nullptr; x_cache = nullptr;
+        cur_x = nullptr; cur_sparse = nullptr; cur_qr = nullptr;
+        cur_xy = nullptr; cur_ykv = nullptr; cur_y = nullptr;
+        buf_logits = nullptr; rope_freqs = nullptr;
         encoder_psram = nullptr;
-        w_encoder = encoder_in_flash;
-        kr_cache = (int8_t*)ps_malloc((size_t)n_layer * nh * T_MAX * N);
     }
-    kr_scale   = (float*)ps_malloc((size_t)n_layer * nh * T_MAX * sizeof(float));
-    x_cache    = (float*)ps_malloc((size_t)n_layer * T_MAX * D * sizeof(float));
-    cur_x      = (float*)ps_malloc(D * sizeof(float));
-    cur_sparse = (float*)ps_malloc((size_t)nh * N * sizeof(float));
-    cur_qr     = (float*)ps_malloc(N * sizeof(float));
-    cur_xy     = (float*)ps_malloc((size_t)nh * N * sizeof(float));
-    cur_ykv    = (float*)ps_malloc(D * sizeof(float));
-    cur_y      = (float*)ps_malloc(D * sizeof(float));
-    buf_logits = (float*)ps_malloc(256 * sizeof(float));
-    rope_freqs = (float*)ps_malloc(N * sizeof(float));
-
-    if (!kr_cache || !kr_scale || !x_cache || !cur_x || !cur_sparse ||
-        !cur_qr || !cur_xy || !cur_ykv || !cur_y || !buf_logits ||
-        !rope_freqs)
-        return false;
 
     compute_rope_freqs(rope_freqs, N, powf(2.0f, 16.0f));
     return true;
@@ -358,9 +372,19 @@ void setup() {
     }
 
     size_t psram_before = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
-    if (!bdh_init_from_blob(mapped)) {
-        Serial.println("ERROR: bad weights (magic mismatch or PSRAM alloc failed)");
+
+    // Distinguish the two failure modes — they need opposite fixes.
+    const WeightHeader* probe = (const WeightHeader*)mapped;
+    if (probe->magic != 0x42444802) {
+        Serial.printf("ERROR: bad weights magic 0x%08lX (expected 0x42444802)\n",
+                      (unsigned long)probe->magic);
         Serial.println("Re-run export_weights.py (layout v2) and reflash weights.bin");
+        while (1) delay(1000);
+    }
+    if (!bdh_init_from_blob(mapped)) {
+        Serial.printf("ERROR: PSRAM allocation failed (%u bytes free, D=%lu N=%lu T_MAX=%d)\n",
+                      (unsigned)psram_before, probe->d_model, probe->n_inner, T_MAX);
+        Serial.println("The model doesn't fit. Lower T_MAX in the .ino and reflash.");
         while (1) delay(1000);
     }
     size_t psram_after = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);

@@ -150,6 +150,24 @@ encoder    4*2880*192   = 2,211,840 B = 2.11 MB   -> fits, ~150KB to spare
 ```
 
 So the encoder fits **only just**, and only at T_MAX=80. Raising T_MAX costs
-~69KB/position and will evict it. The firmware allocates the encoder copy
-*before* the caches and falls back to reading from flash if the caches then
-fail, so a bad budget degrades speed instead of failing to boot.
+~69KB/position and will evict it.
+
+**This margin bites.** After flashing a different checkpoint the board came
+up with `ERROR: bad weights (magic mismatch or PSRAM alloc failed)` — the
+weights were fine (header verified 0x42444802, D=192, correct size); the
+PSRAM allocation had intermittently failed at 7.98MB of 8.00MB used.
+
+The first fallback was inadequate: it only retried if `kr_cache` failed, so
+if the hoist succeeded and a *later, smaller* allocation failed, it returned
+false and bricked the boot. It's now a two-attempt loop — try the whole
+buffer set with the encoder hoisted, and on *any* failure free everything
+and retry reading the encoder from flash. A tight budget now costs 12%
+speed, never a dead board.
+
+The error messages are also split: a magic mismatch and an allocation
+failure need opposite fixes (reflash weights vs lower T_MAX), and
+conflating them cost a diagnosis cycle.
+
+**If you raise T_MAX, the encoder hoist is what stops fitting first** — and
+since it's only worth 12%, trading it for longer stories is a reasonable
+deal. The firmware makes that trade automatically.

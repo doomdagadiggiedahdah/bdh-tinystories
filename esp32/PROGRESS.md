@@ -35,16 +35,38 @@ First on-device output (step-200 checkpoint, loss 2.05):
 
 ## Update weights after training (checkpoint → board)
 
+Point it at a checkpoint. That's the whole workflow — it exports, finds the
+port, and flashes:
+
 ```bash
-python esp32/export_weights.py checkpoints/step_010000.pt esp32/weights.bin
-esp32/flash.sh /dev/ttyACM0        # compiles, uploads firmware, flashes weights
-arduino-cli monitor -p /dev/ttyACM0 -c baudrate=115200   # talk to it
+esp32/update_weights.sh step_000999.pt
 ```
 
-If only weights changed (no .ino edits), skip the firmware step:
+Then talk to it:
 ```bash
-uv tool run esptool --port /dev/ttyACM0 write_flash 0x100000 esp32/weights.bin
+uv run --with pyserial esp32/bench.py --reset --prompt "Once upon a time"
+arduino-cli monitor -p /dev/ttyACM0 -c baudrate=115200
 ```
+
+Notes on the script:
+- The port is a **flag**, not a positional: `--port /dev/ttyACM1`. (It used
+  to be the second positional arg, which meant a shell brace expansion like
+  `step_000{999,800}.pt` silently passed the second checkpoint as the port.)
+- Pass several checkpoints and it refuses rather than guessing — with
+  `step_000{999,800}.pt` the "last" one is the *older* checkpoint.
+- Skips the ~50s write if the exported weights are byte-identical to last
+  time; `--force` overrides.
+- Fails with a clear message if a serial monitor is holding the port.
+
+Only needed if you edited the `.ino` (weights alone don't need a firmware
+rebuild):
+```bash
+esp32/flash.sh /dev/ttyACM0        # compiles, uploads firmware, flashes weights
+```
+
+**Checkpoints must be D=192 / mlp_mult=60** (~6.7M params, 6.42MB int8) to
+fit the 6.9MB flash region. The older D=256 / mlp_mult=50 run (9.96M params)
+needs ~9.9MB and cannot run on this board.
 
 Host-side sanity check before flashing (compares C forward pass vs PyTorch —
 harness lives in the job tmp dir, rebuild from `PROGRESS` notes if gone):
