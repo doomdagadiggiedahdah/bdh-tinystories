@@ -1,7 +1,8 @@
 # BDH on ESP32-S3 — Progress
 
 **Status (2026-08-13): WORKING.** The BDH model runs on the XIAO ESP32-S3 Sense,
-generating text over serial at **0.49 tok/s**.
+generating text over serial at **0.95 tok/s** (was 0.49 — see the speed
+section and `EXPERIMENTS.md`).
 
 First on-device output (step-200 checkpoint, loss 2.05):
 ```
@@ -15,7 +16,10 @@ First on-device output (step-200 checkpoint, loss 2.05):
 |---|---|
 | `export_weights.py` | checkpoint `.pt` → `weights.bin` (int8, layout v2: transposed encoders) |
 | `bdh_tinystories/bdh_tinystories.ino` | incremental BDH inference + serial REPL |
+| `bdh_tinystories/build_opt.h` | `-O3` for the sketch (Arduino defaults to `-Os`; this is worth 1.64x) |
 | `flash.sh` | compile + upload firmware + flash weights |
+| `bench.py` | drive the REPL over serial, print the per-stage profile |
+| `EXPERIMENTS.md` | append-only log of speed experiments, including dead ends |
 
 ## Board / model facts
 
@@ -49,45 +53,79 @@ both, compare logits. Worth redoing after any .ino math change.
 
 ## Speed: where the time goes & what to try
 
-Currently 0.49 tok/s (~2s/token). Per token: ~13MB flash reads (encoder +
-encoder_v + decoder × 6 layers) + attention over int8 PSRAM caches.
-Already done: incremental inference (was 10+ min/token naive), transposed
-weight layouts for sequential flash reads, decoder rows skipped when the
-ReLU gate is zero.
+**Now 0.95 tok/s** (~1.05s/token), up from 0.55 measured / 0.49 previously
+reported. Two changes got there: `-O3` (1.64x) and hoisting the encoder
+tensor into PSRAM (+12%). Full history, including three dead ends, is in
+`EXPERIMENTS.md` — **read it before trying anything below.**
 
-Ideas, roughly by expected payoff:
+Measured per-stage breakdown at 0.95 tok/s (`PROFILE 1` in the .ino prints
+this after every generation):
 
-1. **ESP32-S3 SIMD (PIE)** — 128-bit vector int8 MACs via `ee.vmulas.s8`
-   etc. The inner dot products are scalar float; quantizing activations to
-   int8 per-token and using PIE could give 2–4x. esp-dsp library has
-   primitives (`dsps_dotprod_s8`).
-2. **Quantize activations to int8 throughout** — even without SIMD, int
-   math beats float on this core; also halves PSRAM cache traffic.
-3. **Exploit more sparsity** — x_sparse is ReLU output (~50%+ zeros).
-   Encoder_v gate already skips when x_sparse[n]==0; could also skip
-   encoder dot products via a threshold, or process only top-k neurons.
-4. **Both cores** — inference is single-core; FreeRTOS task on core 0
-   could take half the heads/neurons. Near-2x if memory bandwidth allows.
-5. **Flash → PSRAM copy of hot weights** — PSRAM (OPI, 80MHz) is faster
-   than DIO flash. Weights (6.42MB) + caches (5.86MB) > 8MB, so can't
-   hold both fully; but at T_MAX=48 caches shrink to ~3.4MB, leaving room
-   to host encoder+encoder_v (4.4MB) in PSRAM. Tradeoff: shorter stories.
-6. **Higher flash clock** — sketch runs DIO; check if board supports QIO
-   80MHz (`arduino-cli` FlashMode option) for ~2x flash bandwidth.
-7. **Compiler flags** — Arduino builds with `-Os` (size). Force `-O3
-   -ffast-math` for the sketch (build_opt.h / platform.local.txt). Trivial
-   to try, possibly 1.5x+ on the float inner loops. Do this FIRST.
-8. **Skip lm_head during prompt** — logits are computed every step but only
-   needed for the last prompt byte and during generation. Guard with a flag.
-   Small (~2%) but free.
-9. **Cheaper RoPE trig** — ~34k `cosf`/`sinf` calls per token. Replace with
-   a per-frequency incremental rotation (angle addition formula: rotate the
-   previous position's (cos,sin) by a precomputed per-freq delta) or a
-   lookup table. Maybe 30-50ms/token.
-10. **Verify after any change** — rebuild the host harness (compile .ino
-    with `-DARDUINO_HOST_TEST`, feed same weights.bin + prompt, diff logits
-    vs PyTorch). A speed hack that breaks math should fail here, not on
-    the board.
+```
+encoder      543 ms/tok  52.9%
+encoder_v    167 ms/tok  16.3%
+attention    147 ms/tok  14.4%
+rope+quant   110 ms/tok  10.7%
+decoder       56 ms/tok   5.4%
+lm_head+embed  3 ms/tok   0.3%
+```
+
+The encoder dominates because weights are shared across layers: all 6
+layers re-read the whole 2.11MB tensor, ~13.3MB of reads per token.
+
+**What the bottleneck actually is.** Not flash bandwidth, not arithmetic
+throughput — both were tested and neither moved it (see `EXPERIMENTS.md`).
+The remaining explanation is cache-miss latency against a 13.3MB/token
+working set streamed through a 32KB cache. **So the thing to optimize is
+bytes read per token.** Ideas that make bytes move *faster* have twice
+disappointed; ideas that make bytes *fewer* are untested and promising.
+
+Ideas, reprioritized by that finding:
+
+1. **int4 encoder weights** — halves the encoder's 13.3MB/token, hitting
+   the actual constraint. Best remaining idea. Measure quality on host
+   first: int4 per-row scales on the encoder only, check logit drift and
+   validation loss before flashing.
+2. **Exploit more sparsity** — ~74% of encoder_v rows and ~93% of decoder
+   rows are already skipped via the ReLU gate (measured). The encoder
+   itself can't use this — its output *defines* the sparsity pattern, so
+   all N rows must be read before you know which are zero. A cheap
+   *predictor* of which neurons will fire (low-rank probe, or an int4
+   first pass to threshold) would break that circularity and is the only
+   way to cut the encoder's row count.
+3. **Both cores** — inference is single-core; a FreeRTOS task on core 0
+   could take half the heads. The one "go faster" idea still standing,
+   since it adds a second cache path rather than a faster one.
+4. **Cheaper RoPE trig** — rope+quant is 110ms (10.7%), ~34k `cosf`/`sinf`
+   per token. Incremental rotation (angle-addition from the previous
+   position) or a LUT. Straightforward ~50-80ms.
+5. **Skip lm_head during prompt** — only needed for the last prompt byte.
+   Tiny (3ms/tok) but free.
+6. **esp-dsp SIMD (`dsps_dotprod_s8`)** — was idea #1 in the old list.
+   Demoted: run #4 showed the core isn't starved on arithmetic, so SIMD
+   likely helps less than the 2-4x once hoped. Try after int4.
+7. **Verify after any change** — rebuild the host harness (compile .ino
+   with `-DARDUINO_HOST_TEST`, feed same weights.bin + prompt, diff logits
+   vs PyTorch). A speed hack that breaks math should fail here, not on
+   the board. Nothing in this session changed the math (the one change
+   that did, run #4, was reverted), so no re-verification was needed —
+   but int4 will absolutely need it.
+
+Dead ends — do not retry, reasons in `EXPERIMENTS.md`:
+- **QIO flash mode** — impossible with OPI PSRAM; they share SPI pins, the
+  core silently forces DIO.
+- **int8 activation quantization** — measurably *slower* than float on the
+  LX7, and costs accuracy.
+
+## Benchmarking
+
+`esp32/bench.py` drives the REPL over serial and prints the profile
+(opens the port with DTR/RTS deasserted, which is what stops the board
+from resetting into the bootloader):
+
+```bash
+uv run --with pyserial esp32/bench.py --reset --prompt "Once upon a time"
+```
 ## Longer generations (currently capped at T_MAX=80 bytes)
 
 1. **Sliding-window attention (ring buffer)** — when t reaches T_MAX, evict

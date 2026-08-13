@@ -21,6 +21,28 @@
 // Max sequence length (prompt + generation). Cache cost ~71KB/position.
 #define T_MAX 80
 
+// --- Per-stage profiling ---
+// Wraps each stage in micros() timers so we optimize what is actually slow
+// rather than what looks slow. Costs ~24 micros() calls per stage per token,
+// which is noise against a ~2s token. Set to 0 for a clean build.
+#define PROFILE 1
+
+#if PROFILE && !defined(ARDUINO_HOST_TEST)
+enum { PF_EMBED, PF_ENCODER, PF_ROPE, PF_ATTN, PF_ENCV, PF_DECODER, PF_LMHEAD, PF_N };
+static const char* pf_names[PF_N] = {
+    "embed", "encoder", "rope+quant", "attention", "encoder_v", "decoder", "lm_head"
+};
+static uint32_t pf_us[PF_N];
+static uint32_t pf_t0;
+#define PF_START()   (pf_t0 = micros())
+#define PF_END(slot) (pf_us[slot] += micros() - pf_t0)
+#define PF_RESET()   memset(pf_us, 0, sizeof(pf_us))
+#else
+#define PF_START()
+#define PF_END(slot)
+#define PF_RESET()
+#endif
+
 // --- Weight header (64 bytes, matches export_weights.py) ---
 struct __attribute__((packed)) WeightHeader {
     uint32_t magic;      // 0x42444802 — layout v2 (transposed encoders)
@@ -49,6 +71,9 @@ static const int8_t* w_encoder_v;  // [nh][N][D]
 static const int8_t* w_decoder;    // [nhN][D]
 static const int8_t* w_lm_head;    // [D][vocab]
 static float s_embed, s_encoder, s_encoder_v, s_decoder, s_lm_head;
+
+// Non-null if the encoder tensor was hoisted from flash into PSRAM.
+static int8_t* encoder_psram = nullptr;
 
 // --- Incremental caches (PSRAM) ---
 // kr_cache: RoPE'd sparse activations, int8 per (layer, head, pos)
@@ -121,11 +146,13 @@ static void bdh_step(uint8_t token) {
     int t = seq_pos;
 
     // 1. Embedding + LayerNorm
+    PF_START();
     {
         const int8_t* row = w_embed + (uint32_t)token * D;
         for (int d = 0; d < (int)D; d++) cur_x[d] = (float)row[d] * s_embed;
         layernorm(cur_x, cur_x, D);
     }
+    PF_END(PF_EMBED);
 
     // 2. Layers (shared weights)
     for (int l = 0; l < (int)n_layer; l++) {
@@ -136,14 +163,17 @@ static void bdh_step(uint8_t token) {
         // Per head: sparse projection, RoPE, attention
         for (int h = 0; h < (int)nh; h++) {
             // 2a. x_sparse = relu(x @ encoder[h]) — encoder row n is D sequential bytes
+            PF_START();
             const int8_t* enc_h = w_encoder + (uint32_t)h * N * D;
             float* xs = cur_sparse + h * N;
             for (int n = 0; n < (int)N; n++) {
                 float v = dot_f32_i8(cur_x, enc_h + (uint32_t)n * D, D) * s_encoder;
                 xs[n] = v > 0 ? v : 0;
             }
+            PF_END(PF_ENCODER);
 
             // 2b. RoPE current position, quantize into cache
+            PF_START();
             rope_apply(xs, cur_qr, rope_freqs, t, N);
             {
                 float absmax = 0;
@@ -159,9 +189,11 @@ static void bdh_step(uint8_t token) {
                 }
                 kr_scale[((uint32_t)l * nh + h) * T_MAX + t] = sc;
             }
+            PF_END(PF_ROPE);
 
             // 2c. Attention: yKV[h] = sum_{t2<t} (qr . kr[t2]) * x_cache[l][t2]
             //     (strictly causal — diagonal excluded, matches tril(-1))
+            PF_START();
             for (int d = 0; d < (int)D; d++) cur_ykv[d] = 0;
             for (int t2 = 0; t2 < t; t2++) {
                 const int8_t* krc = kr_cache + (((uint32_t)l * nh + h) * T_MAX + t2) * N;
@@ -171,8 +203,10 @@ static void bdh_step(uint8_t token) {
                 for (int d = 0; d < (int)D; d++) cur_ykv[d] += score * xv[d];
             }
             layernorm(cur_ykv, cur_ykv, D);
+            PF_END(PF_ATTN);
 
             // 2d. Gate: xy = x_sparse * relu(yKV @ encoder_v[h])
+            PF_START();
             const int8_t* encv_h = w_encoder_v + (uint32_t)h * N * D;
             float* xy = cur_xy + h * N;
             for (int n = 0; n < (int)N; n++) {
@@ -180,9 +214,11 @@ static void bdh_step(uint8_t token) {
                 float v = dot_f32_i8(cur_ykv, encv_h + (uint32_t)n * D, D) * s_encoder_v;
                 xy[n] = v > 0 ? xs[n] * v : 0;
             }
+            PF_END(PF_ENCV);
         }
 
         // 2e. Decoder: y[d] = sum_i xy[i] * decoder[i][d], skipping zero rows
+        PF_START();
         for (int d = 0; d < (int)D; d++) cur_y[d] = 0;
         for (int i = 0; i < (int)nhN; i++) {
             float g = cur_xy[i];
@@ -195,9 +231,11 @@ static void bdh_step(uint8_t token) {
         layernorm(cur_y, cur_y, D);
         for (int d = 0; d < (int)D; d++) cur_x[d] += cur_y[d];
         layernorm(cur_x, cur_x, D);
+        PF_END(PF_DECODER);
     }
 
     // 3. Logits: accumulate over sequential lm_head rows
+    PF_START();
     for (int v = 0; v < 256; v++) buf_logits[v] = 0;
     for (int d = 0; d < (int)D; d++) {
         float xv = cur_x[d];
@@ -205,6 +243,7 @@ static void bdh_step(uint8_t token) {
         for (int v = 0; v < 256; v++) buf_logits[v] += xv * (float)row[v];
     }
     for (int v = 0; v < 256; v++) buf_logits[v] *= s_lm_head;
+    PF_END(PF_LMHEAD);
 
     seq_pos = t + 1;
 }
@@ -233,7 +272,30 @@ static bool bdh_init_from_blob(const void* blob) {
     w_decoder = data;    data += (uint32_t)nhN * D;
     w_lm_head = data;
 
-    kr_cache   = (int8_t*)ps_malloc((size_t)n_layer * nh * T_MAX * N);
+    // Hoist the encoder into PSRAM. It's the hottest weight tensor: every
+    // layer re-reads all nh*N*D bytes (weights are shared, activations
+    // differ), so it costs ~13MB of reads per token — 56% of the time.
+    // Flash is stuck at DIO (~20MB/s) because OPI PSRAM claims the pins
+    // needed for QIO; PSRAM itself is octal and ~4x faster. Allocate this
+    // BEFORE the caches so it gets a contiguous block, and fall back to
+    // reading from flash if it doesn't fit.
+    const int8_t* encoder_in_flash = w_encoder;
+    encoder_psram = (int8_t*)ps_malloc((size_t)nh * N * D);
+    if (encoder_psram) {
+        memcpy(encoder_psram, encoder_in_flash, (size_t)nh * N * D);
+        w_encoder = encoder_psram;
+    }
+
+    // The caches are mandatory, the PSRAM encoder copy is an optimization —
+    // if the big one won't fit alongside it, hand the memory back and read
+    // the encoder from flash instead of failing to boot.
+    kr_cache = (int8_t*)ps_malloc((size_t)n_layer * nh * T_MAX * N);
+    if (!kr_cache && encoder_psram) {
+        free(encoder_psram);
+        encoder_psram = nullptr;
+        w_encoder = encoder_in_flash;
+        kr_cache = (int8_t*)ps_malloc((size_t)n_layer * nh * T_MAX * N);
+    }
     kr_scale   = (float*)ps_malloc((size_t)n_layer * nh * T_MAX * sizeof(float));
     x_cache    = (float*)ps_malloc((size_t)n_layer * T_MAX * D * sizeof(float));
     cur_x      = (float*)ps_malloc(D * sizeof(float));
@@ -246,7 +308,8 @@ static bool bdh_init_from_blob(const void* blob) {
     rope_freqs = (float*)ps_malloc(N * sizeof(float));
 
     if (!kr_cache || !kr_scale || !x_cache || !cur_x || !cur_sparse ||
-        !cur_qr || !cur_xy || !cur_ykv || !cur_y || !buf_logits || !rope_freqs)
+        !cur_qr || !cur_xy || !cur_ykv || !cur_y || !buf_logits ||
+        !rope_freqs)
         return false;
 
     compute_rope_freqs(rope_freqs, N, powf(2.0f, 16.0f));
@@ -303,8 +366,11 @@ void setup() {
     size_t psram_after = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
 
     Serial.printf("Model: D=%lu nh=%lu N=%lu layers=%lu vocab=%lu\n", D, nh, N, n_layer, vocab_size);
-    Serial.printf("PSRAM caches: %.2f MB (T_MAX=%d)\n",
+    Serial.printf("PSRAM used: %.2f MB (T_MAX=%d)\n",
         (psram_before - psram_after) / (1024.0f * 1024.0f), T_MAX);
+    Serial.printf("Encoder in %s%s\n",
+        encoder_psram ? "PSRAM" : "flash",
+        encoder_psram ? "" : " (didn't fit — expect ~2x slower)");
     Serial.printf("\nReady! Type a story prompt and press Enter.\n");
     Serial.printf("(max %d bytes total, temperature=0.8)\n\n", T_MAX);
     Serial.flush();
@@ -321,6 +387,7 @@ void loop() {
     Serial.flush();
 
     bdh_reset();
+    PF_RESET();
     int prompt_len = min((int)input.length(), T_MAX - 16);
     unsigned long t0 = millis();
     for (int i = 0; i < prompt_len; i++) {
@@ -342,9 +409,25 @@ void loop() {
     }
     unsigned long t_gen = millis() - t0;
 
-    Serial.printf("\n[prompt %d B in %.1fs | %d tokens in %.1fs = %.2f tok/s]\n\n",
+    Serial.printf("\n[prompt %d B in %.1fs | %d tokens in %.1fs = %.2f tok/s]\n",
         prompt_len, t_prompt / 1000.0f, gen, t_gen / 1000.0f,
         gen * 1000.0f / (float)t_gen);
+
+#if PROFILE
+    {
+        int steps = prompt_len + gen;
+        uint32_t total = 0;
+        for (int i = 0; i < PF_N; i++) total += pf_us[i];
+        Serial.printf("[profile: %d steps, %.1f ms/step accounted]\n",
+                      steps, total / 1000.0f / steps);
+        for (int i = 0; i < PF_N; i++) {
+            Serial.printf("  %-11s %7.1f ms/tok  %5.1f%%\n", pf_names[i],
+                          pf_us[i] / 1000.0f / steps,
+                          total ? 100.0f * pf_us[i] / total : 0.0f);
+        }
+    }
+#endif
+    Serial.println();
     Serial.flush();
 }
 
