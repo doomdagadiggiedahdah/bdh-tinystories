@@ -18,3 +18,7 @@ run.py
 docker_run.sh
 train_shakespeare.py
 train_tinystories.py
+
+# ESP32 build artifacts (weights.bin is regenerable via esp32/export_weights.py)
+esp32/weights.bin
+*.pt
