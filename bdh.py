@@ -158,7 +158,7 @@ class BDH(nn.Module):
         temperature: float = 1.0,
         top_k: int | None = None,
     ) -> torch.Tensor:
-        for _ in range(max_new_tokens):
+        for i in range(max_new_tokens):
             idx_cond = idx
             logits, _ = self(idx_cond)
             logits = logits[:, -1, :] / temperature
@@ -168,4 +168,9 @@ class BDH(nn.Module):
             probs = F.softmax(logits, dim=-1)
             idx_next = torch.multinomial(probs, num_samples=1)
             idx = torch.cat((idx, idx_next), dim=1)
+            # Every step here has a different sequence length, and the MPS allocator
+            # caches buffers per shape — over 200 tokens the pool grows past 12 GB
+            # while holding <50 MB of live tensors, starving training of memory.
+            if idx.device.type == "mps" and (i + 1) % 10 == 0:
+                torch.mps.empty_cache()
         return idx

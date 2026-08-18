@@ -42,6 +42,11 @@ python -c "import torch; print('CUDA' if torch.cuda.is_available() else 'MPS' if
 Report what was detected. If CPU-only, set expectations: "Training will work
 but take roughly 10x longer than with a GPU."
 
+If **MPS** (Apple Silicon), read the "Apple Silicon specifics" section near the
+bottom of this file before continuing — batch sizing and memory behave
+differently there, and skipping it will cost you two failed training runs.
+Set expectations: roughly 0.4 steps/s at batch 8, so ~90 min for 2000 steps.
+
 ### Phase 2: Download Training Data
 
 **Explain**: "Next I'll download TinyStories — a dataset of 2.1 million short
@@ -66,8 +71,13 @@ that works."
 python train.py --step find_batch
 ```
 
-This runs a full forward+backward pass (not just forward — backward pass
-roughly doubles memory usage due to gradients and optimizer state).
+This runs a full forward+backward pass (not just forward — the backward pass
+roughly doubles memory usage due to gradients).
+
+Note it does **not** allocate AdamW's optimizer state, which real training adds
+on the first `optimizer.step()`. So its answer is optimistic. On Apple Silicon
+use one or two below what it reports (see "Apple Silicon specifics"); on CUDA
+the reported value is usually fine.
 
 Report the result: "Your GPU can handle batch_size=<N>, processing <N×512>
 bytes per training step."
@@ -90,6 +100,10 @@ python train.py --batch_size <BATCH> --max_iters 10000 \
 ```
 
 Run this in the background so you stay responsive to the user.
+
+On Apple Silicon, prefix the command with the memory watermarks (see "Apple
+Silicon specifics") and budget ~22 s per sample step on top of training time —
+a 29-entry `--sample_steps` list adds ~11 minutes.
 
 ### Phase 5: Show Early Results
 
@@ -194,6 +208,43 @@ When training finishes (or the user asks about results):
 4. Show the full progression table from samples.log — the journey from
    random bytes to stories is the main artifact of this project
 5. Offer to run `chat.py` to interact with the trained model
+
+## Apple Silicon specifics
+
+Measured on an M4 Mac mini, 16 GB unified memory. Read before Phase 3 if the
+device is MPS.
+
+**Set both memory watermarks.** Ratios are relative to
+`torch.mps.recommended_max_memory()` (12.71 GB on a 16 GB machine), not physical
+RAM. The default high watermark of 1.7 allows ~21 GB, which swaps instead of
+failing cleanly. Setting only the high ratio errors with
+`invalid low watermark ratio` — set both.
+
+```bash
+PYTORCH_MPS_LOW_WATERMARK_RATIO=0.9 PYTORCH_MPS_HIGH_WATERMARK_RATIO=1.0 \
+  python train.py ...
+```
+
+**`find_batch` overshoots.** It never calls `optimizer.step()`, so it misses
+AdamW's state (two extra copies of all 10M params). It reported 10; 8 is what
+survives. Subtract one or two from whatever it reports.
+
+**Generation memory trap (already fixed — don't remove it).** `bdh.py:generate`
+and `chat.py:generate_streaming` call `torch.mps.empty_cache()` every 10 tokens.
+This is required, not an optimization. With no KV cache, generating N bytes means
+N forward passes at N different sequence lengths; the MPS allocator caches per
+shape and never reuses, so one 200-byte sample grew the pool to 12 GB while
+holding <50 MB live, then starved training at *any* batch size. Symptom: an OOM
+during a training step that doesn't respond to lowering the batch. Diagnose by
+comparing `torch.mps.current_allocated_memory()` (live) against
+`torch.mps.driver_allocated_memory()` (claimed) — a large gap is allocator cache.
+Calling `empty_cache()` afterwards barely helps; it must run *during* generation.
+Peak 12.03 → 1.09 GB, for ~4% generation speed.
+
+**Performance:** ~0.43 steps/s at batch 8 (~2.4 s/step), 9.7 GB peak, ~90 min for
+2000 steps including ~22 s per sample point. Don't bother with bfloat16 — stable
+but only 11% faster; the workload is memory-bandwidth bound. The float32 autocast
+warning at startup is expected.
 
 ## Model details
 

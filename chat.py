@@ -65,7 +65,7 @@ def generate_streaming(model, device, prompt_text, max_new_tokens=500, temperatu
     sys.stdout.flush()
 
     with torch.no_grad():
-        for _ in range(max_new_tokens):
+        for i in range(max_new_tokens):
             logits, _ = model(idx)
             logits = logits[:, -1, :] / temperature
             if top_k is not None:
@@ -83,6 +83,11 @@ def generate_streaming(model, device, prompt_text, max_new_tokens=500, temperatu
                 char = f"\\x{byte_val:02x}"
             sys.stdout.write(char)
             sys.stdout.flush()
+
+            # See bdh.BDH.generate — the MPS allocator caches per sequence length,
+            # so a long generation balloons the pool without this.
+            if idx.device.type == "mps" and (i + 1) % 10 == 0:
+                torch.mps.empty_cache()
 
     print()  # newline after generation
 
